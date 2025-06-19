@@ -10,6 +10,10 @@ interface OpenWebUIKBSyncSettings {
     syncState: Record<string, string[]>; // file path -> array of knowledge base names
     fileMapping: Record<string, OpenWebUIFileRecord>; // file path -> OpenWebUI file info
     
+    // NEW: Obsidian Index feature
+    obsidianIndexEnabled: boolean; // enable/disable obsidian index generation
+    obsidianIndexKnowledgeBase: string; // name of the KB to sync the index to
+    
     debugMode: boolean; // enable detailed console logging
 }
 
@@ -29,6 +33,8 @@ const DEFAULT_SETTINGS: OpenWebUIKBSyncSettings = {
     autoSyncInterval: 5, // 5 minutes default
     syncState: {}, // track which files are synced to which KBs
     fileMapping: {}, // ENHANCED: track OpenWebUI file mappings
+    obsidianIndexEnabled: false, // NEW: obsidian index feature disabled by default
+    obsidianIndexKnowledgeBase: 'Obsidian Index', // NEW: default KB name for index
     debugMode: false // debug off by default
 };
 
@@ -75,6 +81,42 @@ function generateStableFilename(originalName: string, contentHash: string): stri
     return `${baseName}_${contentHash.substring(0, 8)}.${extension}`;
 }
 
+// NEW: Convert Obsidian links to URI format for OpenWebUI compatibility
+function processObsidianLinks(content: string, vaultName: string): string {
+    const encodedVaultName = encodeURIComponent(vaultName);
+    
+    // Convert [[Internal Link|Display Text]] to markdown link with Obsidian URI
+    content = content.replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, (_, filePath, displayText) => {
+        // Add .md extension only if the path doesn't already have an extension
+        const finalPath = filePath.includes('.') ? filePath : filePath + '.md';
+        const encodedFilePath = encodeURIComponent(finalPath);
+        const obsidianUri = `obsidian://open?vault=${encodedVaultName}&file=${encodedFilePath}`;
+        return `[${displayText}](${obsidianUri})`;
+    });
+    
+    // Convert [[Internal Link]] to markdown link with Obsidian URI
+    content = content.replace(/\[\[([^\]]+)\]\]/g, (_, filePath) => {
+        // Add .md extension only if the path doesn't already have an extension
+        const finalPath = filePath.includes('.') ? filePath : filePath + '.md';
+        const encodedFilePath = encodeURIComponent(finalPath);
+        const obsidianUri = `obsidian://open?vault=${encodedVaultName}&file=${encodedFilePath}`;
+        // Use the filename as display text
+        const displayText = filePath.split('/').pop() || filePath;
+        return `[${displayText}](${obsidianUri})`;
+    });
+    
+    // Convert ![[Embedded File]] to markdown link with note about embedding
+    content = content.replace(/!\[\[([^\]]+)\]\]/g, (_, filePath) => {
+        // For embedded files, don't add .md extension as they could be images, PDFs, etc.
+        const encodedFilePath = encodeURIComponent(filePath);
+        const obsidianUri = `obsidian://open?vault=${encodedVaultName}&file=${encodedFilePath}`;
+        const displayText = filePath.split('/').pop() || filePath;
+        return `*Embedded: [${displayText}](${obsidianUri})*`;
+    });
+    
+    return content;
+}
+
 export default class OpenWebUIKBSyncPlugin extends Plugin {
     settings: OpenWebUIKBSyncSettings;
     statusBarItem: HTMLElement;
@@ -102,7 +144,7 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         this.addStatusBarCSS();
 
         // Add ribbon icon
-        const ribbonIconEl = this.addRibbonIcon('cloud-upload', 'Sync to OpenWebUI Knowledge Base', async (evt: MouseEvent) => {
+        const ribbonIconEl = this.addRibbonIcon('cloud-upload', 'Sync to OpenWebUI Knowledge Base', async () => {
             await this.syncToKnowledgeBase();
         });
         ribbonIconEl.addClass('openwebui-kb-sync-ribbon-class');
@@ -372,6 +414,17 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
             // Handle files that no longer have KB tags
             await this.handleUntaggedFiles(fileGroups);
 
+            // NEW: Sync Obsidian Index if enabled
+            if (this.settings.obsidianIndexEnabled) {
+                try {
+                    this.debug('Syncing Obsidian Index as part of main sync');
+                    await this.syncObsidianIndex();
+                } catch (error) {
+                    this.logError('Failed to sync Obsidian Index during main sync', error);
+                    // Don't fail the entire sync for index issues
+                }
+            }
+            
             this.syncStatus.issyncing = false;
             this.syncStatus.error = false; // Clear any previous error state
             this.updateStatusBar();
@@ -389,7 +442,10 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
     // ENHANCED: File sync with improved state tracking
     async syncFileWithStateTracking(file: TFile, currentKBs: string[]) {
         const filePath = normalizePath(file.path);
-        const content = await this.app.vault.read(file);
+        const rawContent = await this.app.vault.read(file);
+        // Process Obsidian links before uploading to OpenWebUI
+        const vaultName = this.app.vault.getName();
+        const content = processObsidianLinks(rawContent, vaultName);
         const contentHash = generateContentHash(content);
         // Use Vault API instead of Adapter API per guidelines
         const lastModified = file.stat.mtime || Date.now();
@@ -826,6 +882,179 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
             this.updateStatusBar();
         }
     }
+
+    // NEW: Generate Obsidian Index document
+    generateObsidianIndexDocument(): string {
+        const files = this.app.vault.getMarkdownFiles();
+        const allTags = new Set<string>();
+        const fileInfos: Array<{path: string, name: string, tags: string[], modified: Date}> = [];
+        
+        // Get vault name for Obsidian URIs
+        const vaultName = this.app.vault.getName();
+        
+        // Process each file to extract tags and metadata
+        for (const file of files) {
+            try {
+                const cache = this.app.metadataCache.getFileCache(file);
+                const fileTags: string[] = [];
+                
+                // Extract tags from frontmatter and content
+                if (cache) {
+                    // Frontmatter tags
+                    if (cache.frontmatter && cache.frontmatter.tags) {
+                        const frontmatterTags = Array.isArray(cache.frontmatter.tags) 
+                            ? cache.frontmatter.tags 
+                            : [cache.frontmatter.tags];
+                        fileTags.push(...frontmatterTags.map(tag => String(tag)));
+                    }
+                    
+                    // Inline tags
+                    if (cache.tags) {
+                        fileTags.push(...cache.tags.map(tagRef => tagRef.tag));
+                    }
+                }
+                
+                // Add tags to global set
+                fileTags.forEach(tag => allTags.add(tag));
+                
+                fileInfos.push({
+                    path: file.path,
+                    name: file.basename,
+                    tags: fileTags,
+                    modified: new Date(file.stat.mtime)
+                });
+            } catch (error) {
+                this.debug(`Error processing file ${file.path}:`, error);
+            }
+        }
+        
+        // Sort files by name
+        fileInfos.sort((a, b) => a.name.localeCompare(b.name));
+        
+        // Generate markdown document
+        const generatedDateTime = new Date().toLocaleString();
+        
+        let markdown = `# Obsidian Vault Index\n\n`;
+        
+        // Add comprehensive description
+        markdown += `The provided content is an index of an Obsidian Vault named "${vaultName}," generated on ${generatedDateTime}. This index contains a structured overview of all markdown files within the vault, including metadata for efficient navigation and management. Here's a breakdown of its structure:\n\n`;
+        
+        markdown += `## Header:\n`;
+        markdown += `- **Vault name:** ${vaultName}\n`;
+        markdown += `- **Generation date and time:** ${generatedDateTime}\n`;
+        markdown += `- **Total notes:** ${fileInfos.length}\n`;
+        markdown += `- **Total tags:** ${allTags.size}\n\n`;
+        
+        markdown += `## Summary:\n`;
+        markdown += `A comprehensive index containing all markdown files with metadata including title, path, modification date, and associated tags. The notes are presented in alphabetical order by their titles, and each note's details are clearly outlined for easy reference.\n\n`;
+        
+        // List all tags
+        if (allTags.size > 0) {
+            markdown += `## All Tags (${allTags.size}):\n\n`;
+            markdown += `A list of ${allTags.size} tags used in the vault, along with the number of files associated with each tag:\n\n`;
+            const sortedTags = Array.from(allTags).sort();
+            for (const tag of sortedTags) {
+                const tagCount = fileInfos.filter(f => f.tags.includes(tag)).length;
+                markdown += `- \`${tag}\` (${tagCount} files)\n`;
+            }
+            markdown += `\n`;
+        }
+        
+        // List all files
+        markdown += `## All Notes (${fileInfos.length}):\n\n`;
+        markdown += `A list of all ${fileInfos.length} notes, with each note having the following metadata:\n`;
+        markdown += `- **Title:** The title of the note\n`;
+        markdown += `- **Path:** The file path within the vault\n`;
+        markdown += `- **Modified:** The date and time when the note was last modified\n`;
+        markdown += `- **Tags:** Any tags associated with the note\n\n`;
+        for (const fileInfo of fileInfos) {
+            markdown += `---\n`;
+            markdown += `Title: ${fileInfo.name}\n`;
+            markdown += `Path: ${fileInfo.path}\n`;
+            markdown += `Modified: ${fileInfo.modified.toLocaleString()}\n`;
+            
+            if (fileInfo.tags.length > 0) {
+                markdown += `Tags: ${fileInfo.tags.join(', ')}\n`;
+            } else {
+                markdown += `Tags: None\n`;
+            }
+        }
+        
+        markdown += `\n`;
+        
+        // Add metadata footer
+        markdown += `This structured overview allows for efficient navigation and management of the information within the Obsidian Vault. The index was automatically generated by the OpenWebUI KB Sync plugin and last updated on ${generatedDateTime}.\n`;
+        
+        return markdown;
+    }
+    
+    
+    // NEW: Sync Obsidian Index to OpenWebUI
+    async syncObsidianIndex(): Promise<void> {
+        if (!this.settings.obsidianIndexEnabled) {
+            this.debug('Obsidian Index sync disabled, skipping');
+            return;
+        }
+        
+        if (!this.settings.apiToken) {
+            new Notice('Please configure OpenWebUI API token in settings');
+            return;
+        }
+        
+        try {
+            this.debug('Generating Obsidian Index document');
+            const rawIndexContent = this.generateObsidianIndexDocument();
+            // Process Obsidian links in the index content as well
+            const vaultName = this.app.vault.getName();
+            const indexContent = processObsidianLinks(rawIndexContent, vaultName);
+            const contentHash = generateContentHash(indexContent);
+            const filename = `obsidian_index_${contentHash.substring(0, 8)}.md`;
+            
+            // Check if we already have this exact content uploaded
+            const virtualPath = '__obsidian_index__';
+            const existingRecord = this.settings.fileMapping[virtualPath];
+            
+            if (existingRecord && existingRecord.contentHash === contentHash) {
+                this.debug('Obsidian Index content unchanged, skipping upload');
+                return;
+            }
+            
+            // Remove old index if it exists
+            if (existingRecord) {
+                await this.removeFileFromAllKnowledgeBases(existingRecord);
+            }
+            
+            // Upload new index
+            this.debug(`Uploading Obsidian Index as: ${filename}`);
+            const uploadedFile = await this.uploadFile(filename, indexContent);
+            
+            // Create or get the knowledge base
+            const kbId = await this.getOrCreateKnowledgeBase(this.settings.obsidianIndexKnowledgeBase);
+            
+            // Add file to knowledge base
+            await this.addFileToKnowledgeBase(kbId, uploadedFile.id);
+            
+            // Update tracking
+            const newRecord: OpenWebUIFileRecord = {
+                fileId: uploadedFile.id,
+                uploadedFilename: filename,
+                contentHash: contentHash,
+                lastModified: Date.now(),
+                knowledgeBases: [this.settings.obsidianIndexKnowledgeBase]
+            };
+            
+            this.settings.fileMapping[virtualPath] = newRecord;
+            this.settings.syncState[virtualPath] = [this.settings.obsidianIndexKnowledgeBase];
+            await this.saveSettings();
+            
+            this.debug('Obsidian Index synced successfully');
+            new Notice(`Obsidian Index synced to "${this.settings.obsidianIndexKnowledgeBase}" knowledge base`);
+            
+        } catch (error) {
+            this.logError('Failed to sync Obsidian Index', error);
+            new Notice(`Failed to sync Obsidian Index: ${error.message}`);
+        }
+    }
 }
 
 class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
@@ -922,6 +1151,56 @@ class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
                         }
                     }));
         }
+        
+        // NEW: Obsidian Index section with proper heading
+        new Setting(containerEl)
+            .setName('Obsidian Index')
+            .setHeading();
+            
+        new Setting(containerEl)
+            .setName('Enable Obsidian Index')
+            .setDesc('Automatically generate and sync a comprehensive index of all notes and tags to OpenWebUI')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.obsidianIndexEnabled)
+                .onChange(async (value) => {
+                    this.plugin.settings.obsidianIndexEnabled = value;
+                    await this.plugin.saveSettings();
+                    this.display();
+                }));
+                
+        if (this.plugin.settings.obsidianIndexEnabled) {
+            new Setting(containerEl)
+                .setName('Index Knowledge Base name')
+                .setDesc('Name of the knowledge base where the Obsidian index will be stored')
+                .addText(text => text
+                    .setPlaceholder('Obsidian Index')
+                    .setValue(this.plugin.settings.obsidianIndexKnowledgeBase)
+                    .onChange(async (value) => {
+                        if (value.trim()) {
+                            this.plugin.settings.obsidianIndexKnowledgeBase = value.trim();
+                            await this.plugin.saveSettings();
+                        }
+                    }));
+                    
+            new Setting(containerEl)
+                .setName('Generate index now')
+                .setDesc('Manually trigger the generation and sync of the Obsidian index')
+                .addButton(button => button
+                    .setButtonText('Generate & Sync')
+                    .onClick(async () => {
+                        button.setButtonText('Generating...');
+                        button.setDisabled(true);
+                        
+                        try {
+                            await this.plugin.syncObsidianIndex();
+                        } catch (error) {
+                            new Notice(`Failed to sync Obsidian Index: ${error.message}`);
+                        } finally {
+                            button.setButtonText('Generate & Sync');
+                            button.setDisabled(false);
+                        }
+                    }));
+        }
 
         // Advanced section with proper heading
         new Setting(containerEl)
@@ -988,6 +1267,10 @@ class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
         const autoCleanup = featuresList.createEl('li');
         autoCleanup.createEl('strong', { text: 'Automatic cleanup: ' });
         autoCleanup.createSpan({ text: 'Removes files when KB tags are removed' });
+        
+        const obsidianIndex = featuresList.createEl('li');
+        obsidianIndex.createEl('strong', { text: 'Obsidian Index: ' });
+        obsidianIndex.createSpan({ text: 'Automatically generates a comprehensive index of all vault notes and tags for easy overview in OpenWebUI' });
     }
 
     // NEW: Display current file mapping status
@@ -1109,7 +1392,7 @@ class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
         
         const statusPara = statusDiv.createEl('p');
         statusPara.createEl('strong', { text: 'Status: ' });
-        const statusSpan = statusPara.createEl('span', { text: statusText, cls: 'kb-sync-status' });
+        statusPara.createEl('span', { text: statusText, cls: 'kb-sync-status' });
 
         // Manual sync trigger
         new Setting(statusContainer)
