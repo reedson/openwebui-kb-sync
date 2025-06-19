@@ -12,6 +12,7 @@ This is an Obsidian plugin that syncs markdown files tagged with `#kb/knowledge-
 - Auto-sync with configurable intervals (supports 1-minute intervals)
 - Debug mode with detailed console logging
 - Obsidian Index feature for creating a searchable index
+- Link processing to convert Obsidian-style links to URIs for OpenWebUI compatibility
 
 ## Development Commands
 
@@ -56,9 +57,11 @@ The build process:
 ### Core Features
 1. **Tag Processing**: Scans files for `#kb/knowledge-base-name` tags
 2. **Knowledge Base Management**: Auto-creates KBs in OpenWebUI
-3. **File Synchronization**: Uploads files with content hash tracking
+3. **File Synchronization**: Uploads files with content hash tracking and link processing
 4. **State Tracking**: Maintains mapping of files to knowledge bases
 5. **Auto-sync**: Configurable periodic synchronization
+6. **Link Processing**: Converts Obsidian links `[[Link]]` to Obsidian URIs for OpenWebUI compatibility
+7. **Obsidian Index**: Generates comprehensive vault overview with structured note records
 
 ### File Mapping System
 - `syncState`: Tracks which files are synced to which knowledge bases
@@ -280,3 +283,40 @@ const file = this.app.vault.getFileByPath(normalizePath(filePath));
 const el = containerEl.createDiv({cls: 'my-plugin-container'});
 // In CSS: .my-plugin-container { color: var(--text-normal); }
 ```
+
+## Recent Enhancements (2025-06-19)
+
+### Link Processing System
+- **Function**: `processObsidianLinks(content: string, vaultName: string): string`
+- **Purpose**: Converts Obsidian-style links to proper Obsidian URIs for OpenWebUI compatibility
+- **Location**: Applied in `syncFileWithStateTracking()` and `syncObsidianIndex()` before content upload
+- **Conversions**:
+  - `[[Internal Link]]` → `[Internal Link](obsidian://open?vault=VaultName&file=Internal%20Link.md)`
+  - `[[Internal Link|Display Text]]` → `[Display Text](obsidian://open?vault=VaultName&file=Internal%20Link.md)`
+  - `![[Embedded File]]` → `*Embedded: [Embedded File](obsidian://open?vault=VaultName&file=Embedded%20File)*`
+
+### Obsidian Index Format
+- **Structure**: Comprehensive description + Header + Summary + All Tags + All Notes
+- **Note Format**: Each note is exactly 5 lines using horizontal rules:
+  ```
+  ---
+  Title: Note Title
+  Path: folder/note.md  
+  Modified: 6/19/2025, 10:30:00 AM
+  Tags: tag1, tag2
+  ```
+- **Settings**: `obsidianIndexEnabled` (boolean) and `obsidianIndexKnowledgeBase` (string)
+- **Virtual Path**: Uses `__obsidian_index__` for tracking in fileMapping system
+
+### Current State
+- **Latest Commit**: 9e027a9 - "Add link processing and improve Obsidian Index format"
+- **Production Status**: Deployed and tested
+- **OpenWebUI Compatibility**: Links render properly, index format optimized for OpenWebUI display
+- **Known Working**: Link conversion, 5-line note format, comprehensive index descriptions
+
+### Development Notes for Next Session
+- All recent improvements are documented in CHANGELOG.md
+- Link processing integration is complete and tested
+- Index format has been refined based on OpenWebUI rendering feedback
+- No known issues with current implementation
+- Plugin is production-ready with all enhancements
