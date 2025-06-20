@@ -1,4 +1,4 @@
-import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, requestUrl, normalizePath } from 'obsidian';
+import { App, Plugin, PluginSettingTab, Setting, TFile, Notice, requestUrl, normalizePath, Platform } from 'obsidian';
 
 interface OpenWebUIKBSyncSettings {
     openwebuiUrl: string;
@@ -11,6 +11,22 @@ interface OpenWebUIKBSyncSettings {
     fileMapping: Record<string, OpenWebUIFileRecord>; // file path -> OpenWebUI file info
     
     debugMode: boolean; // enable detailed console logging
+    
+    // NEW: Mobile-aware settings
+    mobile: MobileSettings;
+}
+
+// NEW: Mobile-specific settings
+interface MobileSettings {
+    networkBehavior: 'always' | 'wifi-preferred' | 'wifi-only';
+    cellularSyncEnabled: boolean;
+    cellularFileLimit: number; // bytes, 0 = no limit
+    cellularAutoSyncMultiplier: number; // frequency multiplier on cellular
+    maxConcurrentUploads: number;
+    batchSize: number;
+    enableBackgroundSync: boolean;
+    batteryOptimization: boolean;
+    lowBatteryThreshold: number;
 }
 
 // NEW: Enhanced file tracking
@@ -29,7 +45,18 @@ const DEFAULT_SETTINGS: OpenWebUIKBSyncSettings = {
     autoSyncInterval: 5, // 5 minutes default
     syncState: {}, // track which files are synced to which KBs
     fileMapping: {}, // ENHANCED: track OpenWebUI file mappings
-    debugMode: false // debug off by default
+    debugMode: false, // debug off by default
+    mobile: {
+        networkBehavior: 'wifi-preferred',
+        cellularSyncEnabled: true,
+        cellularFileLimit: 1024 * 1024, // 1MB default
+        cellularAutoSyncMultiplier: 2, // half frequency on cellular
+        maxConcurrentUploads: 2,
+        batchSize: 5,
+        enableBackgroundSync: false,
+        batteryOptimization: true,
+        lowBatteryThreshold: 15
+    }
 };
 
 interface KnowledgeBase {
@@ -111,6 +138,35 @@ function processObsidianLinks(content: string, vaultName: string): string {
     return content;
 }
 
+// NEW: Mobile device detection and network utilities
+function isMobileDevice(): boolean {
+    return Platform.isMobile || 
+           /Android|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+}
+
+function getConnectionType(): 'wifi' | 'cellular' | 'unknown' {
+    if ('connection' in navigator) {
+        const connection = (navigator as any).connection;
+        if (connection.type === 'wifi' || connection.effectiveType === 'wifi') {
+            return 'wifi';
+        }
+        if (connection.type === 'cellular' || ['slow-2g', '2g', '3g', '4g'].includes(connection.effectiveType)) {
+            return 'cellular';
+        }
+    }
+    return 'unknown';
+}
+
+async function getBatteryLevel(): Promise<number> {
+    if ('battery' in navigator) {
+        return Promise.resolve(((navigator as any).battery).level * 100);
+    }
+    if ('getBattery' in navigator) {
+        return (navigator as any).getBattery().then((battery: any) => battery.level * 100);
+    }
+    return Promise.resolve(100); // Assume full battery if can't detect
+}
+
 export default class OpenWebUIKBSyncPlugin extends Plugin {
     settings: OpenWebUIKBSyncSettings;
     statusBarItem: HTMLElement;
@@ -124,6 +180,14 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
     
     // NEW: Concurrency protection
     private syncMutex: boolean = false;
+    
+    // NEW: Knowledge base caching
+    private kbCache = new Map<string, {id: string, timestamp: number}>();
+    private readonly KB_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+    
+    // NEW: Network and mobile state
+    private lastCellularWarning = 0;
+    private readonly CELLULAR_WARNING_INTERVAL = 10 * 60 * 1000; // 10 minutes
 
     async onload() {
         await this.loadSettings();
@@ -131,6 +195,22 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         // MIGRATION: Ensure new properties exist
         if (!this.settings.fileMapping) {
             this.settings.fileMapping = {};
+            await this.saveSettings();
+        }
+        
+        // MIGRATION: Ensure mobile settings exist
+        if (!this.settings.mobile) {
+            this.settings.mobile = {
+                networkBehavior: 'wifi-preferred',
+                cellularSyncEnabled: true,
+                cellularFileLimit: 1024 * 1024, // 1MB default
+                cellularAutoSyncMultiplier: 2, // half frequency on cellular
+                maxConcurrentUploads: 2,
+                batchSize: 5,
+                enableBackgroundSync: false,
+                batteryOptimization: true,
+                lowBatteryThreshold: 15
+            };
             await this.saveSettings();
         }
 
@@ -229,6 +309,11 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
             .kb-sync-status {
                 color: var(--text-accent);
             }
+            
+            /* Ribbon icon styling - remove default colors */
+            .openwebui-kb-sync-ribbon-class {
+                color: var(--icon-color) !important;
+            }
         `;
         
         const style = document.createElement('style');
@@ -279,7 +364,18 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         this.stopAutoSync();
         
         if (this.settings.autoSyncEnabled && this.settings.autoSyncInterval > 0) {
-            const intervalMs = this.settings.autoSyncInterval * 60 * 1000; // Convert minutes to milliseconds
+            // NEW: Mobile-aware interval calculation
+            const baseInterval = this.settings.autoSyncInterval;
+            const connectionType = getConnectionType();
+            const isMobile = isMobileDevice();
+            
+            let multiplier = 1;
+            if (isMobile || connectionType === 'cellular') {
+                multiplier = this.settings.mobile.cellularAutoSyncMultiplier;
+            }
+            
+            const intervalMs = baseInterval * multiplier * 60 * 1000;
+            
             this.autoSyncTimer = window.setInterval(async () => {
                 this.debug('Auto-sync triggered');
                 
@@ -289,10 +385,15 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
                     return;
                 }
                 
+                // NEW: Mobile and battery-aware auto-sync
+                if (await this.shouldSkipAutoSync()) {
+                    return;
+                }
+                
                 await this.syncToKnowledgeBase();
             }, intervalMs);
             
-            this.debug(`Auto-sync started with ${this.settings.autoSyncInterval} minute interval`);
+            this.debug(`Auto-sync started with ${baseInterval * multiplier} minute interval (mobile: ${isMobile}, connection: ${connectionType})`);
         }
     }
 
@@ -302,6 +403,80 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
             this.autoSyncTimer = null;
             this.debug('Auto-sync stopped');
         }
+    }
+    
+    // NEW: Mobile and battery-aware sync checks
+    async shouldSkipAutoSync(): Promise<boolean> {
+        const isMobile = isMobileDevice();
+        const settings = this.settings.mobile;
+        
+        // Check battery level if optimization enabled
+        if (isMobile && settings.batteryOptimization) {
+            const batteryLevel = await getBatteryLevel();
+            if (batteryLevel < settings.lowBatteryThreshold) {
+                this.debug(`Auto-sync skipped: low battery (${batteryLevel}% < ${settings.lowBatteryThreshold}%)`);
+                return true;
+            }
+        }
+        
+        // Check if background sync is disabled and app might be backgrounded
+        if (isMobile && !settings.enableBackgroundSync && document.hidden) {
+            this.debug('Auto-sync skipped: app backgrounded and background sync disabled');
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // NEW: Network-aware sync permission check
+    async shouldAllowSync(): Promise<{allow: boolean, reason?: string}> {
+        const connectionType = getConnectionType();
+        const settings = this.settings.mobile;
+        
+        // Always allow WiFi or unknown connections
+        if (connectionType === 'wifi' || connectionType === 'unknown') {
+            return {allow: true};
+        }
+        
+        // Handle cellular based on user preference
+        if (connectionType === 'cellular') {
+            switch (settings.networkBehavior) {
+                case 'always':
+                    return {allow: true};
+                    
+                case 'wifi-preferred':
+                    // Show warning occasionally but allow sync
+                    if (this.shouldShowCellularWarning()) {
+                        new Notice('Syncing over cellular data (change in mobile settings if needed)', 4000);
+                        this.lastCellularWarning = Date.now();
+                    }
+                    return {allow: true};
+                    
+                case 'wifi-only':
+                    return {allow: false, reason: 'WiFi-only mode enabled in mobile settings'};
+                    
+                default:
+                    return {allow: true};
+            }
+        }
+        
+        return {allow: true};
+    }
+    
+    // NEW: Throttle cellular warnings
+    private shouldShowCellularWarning(): boolean {
+        return Date.now() - this.lastCellularWarning > this.CELLULAR_WARNING_INTERVAL;
+    }
+    
+    // NEW: Get mobile-optimized sync configuration
+    getMobileAdjustedConfig(isCellular: boolean) {
+        const settings = this.settings.mobile;
+        
+        return {
+            maxFileSize: isCellular ? settings.cellularFileLimit : 5 * 1024 * 1024,
+            batchSize: isCellular ? Math.min(settings.batchSize, 3) : settings.batchSize,
+            maxConcurrent: isCellular ? 1 : settings.maxConcurrentUploads
+        };
     }
 
     updateStatusBar() {
@@ -331,7 +506,7 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         }
     }
 
-    // ENHANCED: Main sync method with concurrency protection
+    // ENHANCED: Main sync method with concurrency protection and network awareness
     async syncToKnowledgeBase() {
         // CRITICAL: Prevent concurrent syncs
         if (this.syncMutex) {
@@ -342,6 +517,14 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         
         if (!this.settings.apiToken) {
             new Notice('Please configure OpenWebUI API token in settings');
+            return;
+        }
+        
+        // NEW: Check network permissions
+        const syncPermission = await this.shouldAllowSync();
+        if (!syncPermission.allow) {
+            this.debug(`Sync blocked: ${syncPermission.reason}`);
+            new Notice(`Sync blocked: ${syncPermission.reason}`);
             return;
         }
 
@@ -392,16 +575,50 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
 
             this.debug(`Found ${fileGroups.size} files to sync to ${filesToSync.length} knowledge bases`);
 
-            // Process each file
-            for (const [filePath, currentKBs] of fileGroups) {
-                try {
-                    const file = this.app.vault.getAbstractFileByPath(filePath);
-                    if (file instanceof TFile) {
-                        await this.syncFileWithStateTracking(file, currentKBs);
+            // NEW: Mobile-aware batch processing
+            const connectionType = getConnectionType();
+            const isCellular = connectionType === 'cellular';
+            const config = this.getMobileAdjustedConfig(isCellular);
+            
+            this.debug(`Using mobile config: batchSize=${config.batchSize}, maxConcurrent=${config.maxConcurrent}, maxFileSize=${config.maxFileSize}`);
+
+            // Process files in batches
+            const fileEntries = Array.from(fileGroups.entries());
+            for (let i = 0; i < fileEntries.length; i += config.batchSize) {
+                const batch = fileEntries.slice(i, i + config.batchSize);
+                
+                // Process batch with controlled concurrency
+                if (config.maxConcurrent === 1) {
+                    // Sequential processing for cellular
+                    for (const [filePath, currentKBs] of batch) {
+                        try {
+                            const file = this.app.vault.getAbstractFileByPath(filePath);
+                            if (file instanceof TFile) {
+                                await this.syncFileWithStateTracking(file, currentKBs, config);
+                            }
+                        } catch (error) {
+                            this.logError(`Failed to sync file ${filePath}`, error);
+                            new Notice(`Failed to sync ${filePath}: ${error.message}`);
+                        }
                     }
-                } catch (error) {
-                    this.logError(`Failed to sync file ${filePath}`, error);
-                    new Notice(`Failed to sync ${filePath}: ${error.message}`);
+                } else {
+                    // Parallel processing for WiFi
+                    await Promise.all(batch.map(async ([filePath, currentKBs]) => {
+                        try {
+                            const file = this.app.vault.getAbstractFileByPath(filePath);
+                            if (file instanceof TFile) {
+                                await this.syncFileWithStateTracking(file, currentKBs, config);
+                            }
+                        } catch (error) {
+                            this.logError(`Failed to sync file ${filePath}`, error);
+                            new Notice(`Failed to sync ${filePath}: ${error.message}`);
+                        }
+                    }));
+                }
+                
+                // Small delay between batches to prevent overwhelming the system
+                if (i + config.batchSize < fileEntries.length) {
+                    await new Promise(resolve => setTimeout(resolve, isCellular ? 500 : 100));
                 }
             }
 
@@ -423,28 +640,51 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         }
     }
 
-    // ENHANCED: File sync with improved state tracking
-    async syncFileWithStateTracking(file: TFile, currentKBs: string[]) {
+    // ENHANCED: File sync with improved state tracking and mobile awareness
+    async syncFileWithStateTracking(file: TFile, currentKBs: string[], config?: {maxFileSize: number, batchSize: number, maxConcurrent: number}) {
         const filePath = normalizePath(file.path);
-        const rawContent = await this.app.vault.read(file);
-        // Process Obsidian links before uploading to OpenWebUI
-        const vaultName = this.app.vault.getName();
-        const content = processObsidianLinks(rawContent, vaultName);
-        const contentHash = generateContentHash(content);
-        // Use Vault API instead of Adapter API per guidelines
+        
+        // NEW: File modification time check for optimization
         const lastModified = file.stat.mtime || Date.now();
+        const previousRecord = this.settings.fileMapping[filePath];
+        
+        // Quick check: if file hasn't been modified and we have a record, skip reading content
+        const timeChanged = !previousRecord || previousRecord.lastModified !== lastModified;
+        
+        let content: string;
+        let contentHash: string;
+        
+        if (timeChanged) {
+            const rawContent = await this.app.vault.read(file);
+            
+            // NEW: File size check for mobile
+            if (config && config.maxFileSize > 0 && rawContent.length > config.maxFileSize) {
+                const sizeMB = (rawContent.length / (1024 * 1024)).toFixed(2);
+                const limitMB = (config.maxFileSize / (1024 * 1024)).toFixed(2);
+                throw new Error(`File too large (${sizeMB}MB > ${limitMB}MB limit on current connection)`);
+            }
+            
+            // Process Obsidian links before uploading to OpenWebUI
+            const vaultName = this.app.vault.getName();
+            content = processObsidianLinks(rawContent, vaultName);
+            contentHash = generateContentHash(content);
+        } else {
+            // Reuse previous hash if file hasn't changed
+            contentHash = previousRecord.contentHash;
+            content = ''; // Will not be used
+        }
         
         // Get current state
-        const previousRecord = this.settings.fileMapping[filePath];
         const previousKBs = this.settings.syncState[filePath] || [];
         
         this.debug(`Syncing ${filePath}:`);
         this.debug(`  Current KBs: [${currentKBs.join(', ')}]`);
         this.debug(`  Previous KBs: [${previousKBs.join(', ')}]`);
         this.debug(`  Content hash: ${contentHash.substring(0, 16)}...`);
+        this.debug(`  Time changed: ${timeChanged}`);
         
         // Check if file content has changed
-        const contentChanged = !previousRecord || previousRecord.contentHash !== contentHash;
+        const contentChanged = timeChanged && (!previousRecord || previousRecord.contentHash !== contentHash);
         const kbsChanged = JSON.stringify(currentKBs.sort()) !== JSON.stringify(previousKBs.sort());
         
         this.debug(`  Content changed: ${contentChanged}`);
@@ -482,6 +722,13 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         let newRecord: OpenWebUIFileRecord | null = null;
         if (contentChanged || kbsToAddTo.length > 0 || kbsToUpdate.length > 0) {
             try {
+                // Ensure we have content if we need to upload
+                if (!content) {
+                    const rawContent = await this.app.vault.read(file);
+                    const vaultName = this.app.vault.getName();
+                    content = processObsidianLinks(rawContent, vaultName);
+                }
+                
                 const stableFilename = generateStableFilename(file.name, contentHash);
                 this.debug(`  Uploading as: ${stableFilename}`);
                 
@@ -664,12 +911,31 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         await this.saveSettings();
     }
 
+    // NEW: Cached knowledge base lookup
     async findKnowledgeBaseByName(name: string): Promise<string | null> {
+        // Check cache first
+        const cached = this.kbCache.get(name);
+        if (cached && Date.now() - cached.timestamp < this.KB_CACHE_TTL) {
+            this.debug(`KB cache hit for ${name}: ${cached.id}`);
+            return cached.id;
+        }
+        
         try {
             const knowledgeBases = await this.makeApiRequest('/api/v1/knowledge/');
             if (knowledgeBases && Array.isArray(knowledgeBases)) {
+                // Update cache for all knowledge bases
+                for (const kb of knowledgeBases) {
+                    this.kbCache.set(kb.name, {
+                        id: kb.id,
+                        timestamp: Date.now()
+                    });
+                }
+                
                 const existing = knowledgeBases.find((kb: KnowledgeBase) => kb.name === name);
-                return existing ? existing.id : null;
+                const result = existing ? existing.id : null;
+                
+                this.debug(`KB lookup for ${name}: ${result ? result : 'not found'} (cached ${knowledgeBases.length} entries)`);
+                return result;
             }
         } catch (error) {
             this.logError(`Failed to find knowledge base ${name}`, error);
@@ -748,21 +1014,13 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
         return response.json;
     }
 
+    // NEW: Cached get-or-create knowledge base
     async getOrCreateKnowledgeBase(name: string): Promise<string> {
-        try {
-            // Try to list existing knowledge bases
-            const knowledgeBases = await this.makeApiRequest('/api/v1/knowledge/');
-            
-            // Look for existing knowledge base with the same name
-            if (knowledgeBases && Array.isArray(knowledgeBases)) {
-                const existing = knowledgeBases.find((kb: KnowledgeBase) => kb.name === name);
-                if (existing) {
-                    this.debug(`Found existing knowledge base: ${name} (${existing.id})`);
-                    return existing.id;
-                }
-            }
-        } catch (error) {
-            this.debug('Could not fetch knowledge bases, will try to create:', error);
+        // First try cached lookup
+        const existingId = await this.findKnowledgeBaseByName(name);
+        if (existingId) {
+            this.debug(`Found existing knowledge base: ${name} (${existingId})`);
+            return existingId;
         }
 
         // Create new knowledge base
@@ -776,6 +1034,12 @@ export default class OpenWebUIKBSyncPlugin extends Plugin {
                     data: {},
                     access_control: {}
                 }
+            });
+            
+            // Cache the new knowledge base
+            this.kbCache.set(name, {
+                id: newKb.id,
+                timestamp: Date.now()
             });
             
             this.debug(`Created knowledge base: ${name} (${newKb.id})`);
@@ -882,8 +1146,10 @@ class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
 
         containerEl.empty();
 
-        // NO top-level heading per guidelines
-        // Connection settings at top (general settings - no heading)
+        // General settings section
+        new Setting(containerEl)
+            .setName('General settings')
+            .setHeading();
         
         new Setting(containerEl)
             .setName('OpenWebUI URL')
@@ -980,6 +1246,84 @@ class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
                     await this.plugin.saveSettings();
                 }));
 
+        // NEW: Mobile settings section
+        new Setting(containerEl)
+            .setName('Mobile and network')
+            .setHeading();
+
+        new Setting(containerEl)
+            .setName('Cellular sync behavior')
+            .setDesc('How to handle sync when on cellular/mobile data')
+            .addDropdown(dropdown => dropdown
+                .addOption('always', 'Always sync (unlimited data)')
+                .addOption('wifi-preferred', 'Sync with warning (limited data)')
+                .addOption('wifi-only', 'WiFi only (strict data control)')
+                .setValue(this.plugin.settings.mobile.networkBehavior)
+                .onChange(async (value: 'always' | 'wifi-preferred' | 'wifi-only') => {
+                    this.plugin.settings.mobile.networkBehavior = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Cellular file size limit')
+            .setDesc('Maximum file size to sync over cellular in MB (0 = no limit)')
+            .addText(text => text
+                .setPlaceholder('1')
+                .setValue((this.plugin.settings.mobile.cellularFileLimit / (1024 * 1024)).toString())
+                .onChange(async (value) => {
+                    const sizeMB = parseFloat(value) || 0;
+                    this.plugin.settings.mobile.cellularFileLimit = sizeMB * 1024 * 1024;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Cellular auto-sync frequency')
+            .setDesc('Auto-sync frequency multiplier on cellular (2x = half as often)')
+            .addSlider(slider => slider
+                .setLimits(1, 10, 1)
+                .setValue(this.plugin.settings.mobile.cellularAutoSyncMultiplier)
+                .onChange(async (value) => {
+                    this.plugin.settings.mobile.cellularAutoSyncMultiplier = value;
+                    await this.plugin.saveSettings();
+                })
+                .setDynamicTooltip());
+
+        new Setting(containerEl)
+            .setName('Battery optimization')
+            .setDesc('Pause sync when battery is low (mobile devices only)')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.mobile.batteryOptimization)
+                .onChange(async (value) => {
+                    this.plugin.settings.mobile.batteryOptimization = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        if (this.plugin.settings.mobile.batteryOptimization) {
+            new Setting(containerEl)
+                .setName('Low battery threshold')
+                .setDesc('Pause sync when battery level drops below this percentage')
+                .addSlider(slider => slider
+                    .setLimits(5, 50, 5)
+                    .setValue(this.plugin.settings.mobile.lowBatteryThreshold)
+                    .onChange(async (value) => {
+                        this.plugin.settings.mobile.lowBatteryThreshold = value;
+                        await this.plugin.saveSettings();
+                    })
+                    .setDynamicTooltip());
+        }
+
+        new Setting(containerEl)
+            .setName('Mobile batch size')
+            .setDesc('Number of files to process simultaneously on mobile/cellular')
+            .addSlider(slider => slider
+                .setLimits(1, 10, 1)
+                .setValue(this.plugin.settings.mobile.batchSize)
+                .onChange(async (value) => {
+                    this.plugin.settings.mobile.batchSize = value;
+                    await this.plugin.saveSettings();
+                })
+                .setDynamicTooltip());
+
         // NEW: File Mapping Status Section
         this.displayFileMappingStatus(containerEl);
 
@@ -996,6 +1340,11 @@ class OpenWebUIKBSyncSettingTab extends PluginSettingTab {
         // Basic usage section
         instructions.createEl('p', { text: 'To sync files to OpenWebUI Knowledge Base:' });
         const basicList = instructions.createEl('ol');
+        
+        const setupItem = basicList.createEl('li');
+        setupItem.createSpan({ text: 'Configure your OpenWebUI URL and API token in ' });
+        setupItem.createEl('strong', { text: 'General settings' });
+        setupItem.createSpan({ text: ' above' });
         
         const firstItem = basicList.createEl('li');
         firstItem.createSpan({ text: 'Add one or more ' });

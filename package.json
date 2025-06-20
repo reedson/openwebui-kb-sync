@@ -1,6 +1,6 @@
 {
   "name": "openwebui-kb-sync",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Sync Obsidian notes with OpenWebUI Knowledge Base",
   "main": "main.js",
   "scripts": {
